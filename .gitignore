@@ -1,0 +1,5 @@
+data/processed_features.parquet
+__pycache__/
+.env
+venv/
+*.pyc
