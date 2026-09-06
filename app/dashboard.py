@@ -67,7 +67,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import folium
-from folium.plugins import HeatMap
+import shapely
+from shapely.geometry import shape as shapely_shape
+from folium.raster_layers import ImageOverlay
+from scipy.ndimage import gaussian_filter, zoom as ndi_zoom
 from streamlit_folium import st_folium
 
 # ---------------------------------------------------------------------------
@@ -80,7 +83,7 @@ for _p in (APP_DIR, PROJECT_ROOT):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-import app.api as bust_api  # noqa: E402  (import after sys.path setup, by design)
+import api as bust_api  # noqa: E402  (import after sys.path setup, by design)
 import explainability as xai  # noqa: E402
 
 # ===========================================================================
@@ -89,6 +92,7 @@ import explainability as xai  # noqa: E402
 
 DATA_PATH = bust_api.DATA_PATH
 MODEL_PATH = bust_api.MODEL_PATH
+INDIA_BOUNDARY_PATH = APP_DIR / "assets" / "india_boundary.geojson"
 
 REGION_DISPLAY_NAMES: Dict[str, str] = {
     "BoB_Coast": "Odisha & Andhra Coast (Bay of Bengal)",
@@ -203,6 +207,25 @@ CUSTOM_CSS = """
 # ===========================================================================
 
 
+@st.cache_resource(show_spinner=False)
+def load_india_geometry():
+    """Load India's national boundary (mainland + island territories) from a
+    locally-shipped, pre-simplified GeoJSON asset -- no runtime network
+    dependency. Source: Natural-Earth-derived country boundaries, simplified
+    with Shapely (tolerance 0.03 deg) to a resolution appropriate for our
+    0.5 deg data grid. Used to mask both the map visual and every "% of
+    India" style statistic to the country's actual territory, since the
+    raw data grid is a rectangular lat/lon bounding box that -- as observed
+    directly on this dataset -- is only ~28% India by area (the rest is
+    Pakistan, Afghanistan, China, Nepal, Bangladesh, Myanmar, Sri Lanka, and
+    open ocean)."""
+    import json
+
+    with open(INDIA_BOUNDARY_PATH) as f:
+        geojson = json.load(f)
+    return shapely_shape(geojson)
+
+
 @st.cache_resource(show_spinner="Loading model artifact and forecast dataset ...")
 def load_model_and_data():
     artifact = xai.load_artifact(str(MODEL_PATH))
@@ -216,15 +239,25 @@ def load_model_and_data():
     df["macro_zone"] = bust_api.assign_macro_zone(df["lat"].to_numpy(dtype=float), df["lon"].to_numpy(dtype=float))
     df["region_display"] = df["region"].astype(str).map(REGION_DISPLAY_NAMES).fillna(df["region"].astype(str))
 
+    india_geom = load_india_geometry()
+    df["is_india"] = shapely.contains_xy(india_geom, df["lon"].to_numpy(dtype=float), df["lat"].to_numpy(dtype=float))
+
+    # Every statistic (case-scenario matching, KPIs, region confidence,
+    # drill-down defaults, decay chart) is computed from India-only points;
+    # the full (unmasked) df is kept only so the map's raster field has
+    # complete spatial coverage to interpolate from before being visually
+    # clipped to the real border -- see build_probability_raster.
+    df_india = df[df["is_india"]]
+
     case_meta = (
-        df.groupby("init_time")
+        df_india.groupby("init_time")
         .agg(regime=("regime", "first"), max_T2m=("T2m", "max"), mean_T2m=("T2m", "mean"))
         .reset_index()
         .sort_values("init_time")
     )
-    heatwave_threshold = float(df["T2m"].quantile(0.90))
+    heatwave_threshold = float(df_india["T2m"].quantile(0.90))
 
-    return artifact, df, case_meta, heatwave_threshold
+    return artifact, df, case_meta, heatwave_threshold, india_geom
 
 
 @st.cache_data(show_spinner="Computing SHAP-based risk drivers for this forecast view ...")
@@ -236,7 +269,9 @@ def compute_dominant_factors_for_case(_artifact: dict, _case_df: pd.DataFrame, c
 def select_case_init_time(case_meta: pd.DataFrame, event_filter: str, heatwave_threshold: float) -> Optional[pd.Timestamp]:
     """Pick which archived forecast case (init_time) to display for the
     selected scenario filter -- the most recent case whose regime (and, for
-    the Heat Wave proxy, peak temperature) matches."""
+    the Heat Wave proxy, peak temperature) matches. ``case_meta`` is
+    computed from India-only grid points, so e.g. the Heat Wave threshold
+    reflects India's own temperatures, not a neighboring desert's."""
     if event_filter == "Live Forecast Cycle (current)":
         return case_meta["init_time"].max()
     if event_filter == "Monsoon Depression":
@@ -254,16 +289,120 @@ def select_case_init_time(case_meta: pd.DataFrame, event_filter: str, heatwave_t
     return candidates.max()
 
 
-def bust_prob_to_hex(p: float) -> str:
-    """Green (low risk) -> amber -> red (critical) 3-stop gradient."""
+def bust_prob_to_hex(p: float, vmin: float = 0.0, vmax: float = 1.0) -> str:
+    """Green (low risk) -> amber -> red (critical) 3-stop gradient, applied
+    to p after normalising against [vmin, vmax] -- see
+    ``compute_color_scale_range`` for why this may not always be the literal
+    0-1 probability scale."""
+    norm = 0.0 if vmax <= vmin else (p - vmin) / (vmax - vmin)
+    norm = float(np.clip(norm, 0.0, 1.0))
     stops = [(0.0, (46, 125, 50)), (0.5, (249, 199, 79)), (1.0, (198, 40, 40))]
-    p = float(np.clip(p, 0.0, 1.0))
     for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
-        if p0 <= p <= p1:
-            t = (p - p0) / (p1 - p0) if p1 > p0 else 0.0
+        if p0 <= norm <= p1:
+            t = (norm - p0) / (p1 - p0) if p1 > p0 else 0.0
             rgb = tuple(int(c0[i] + (c1[i] - c0[i]) * t) for i in range(3))
             return "#{:02x}{:02x}{:02x}".format(*rgb)
     return "#c62828"
+
+
+def compute_color_scale_range(lead_df: pd.DataFrame, scale_mode: str) -> Tuple[float, float]:
+    """Decide what [vmin, vmax] the green->red gradient should span for this
+    view.
+
+    "adaptive" stretches to the 2nd-98th percentile of the CURRENT view's own
+    bust_probability values. This matters a lot in practice: at short lead
+    times, probability is often genuinely low and tightly clustered (e.g.
+    0.0005-0.007 at Day 1-3 in this dataset) -- under a fixed 0-1 scale that
+    entire range renders as visually-indistinguishable green, hiding real
+    (if small) spatial risk variation. Adaptive scaling always shows that
+    relative pattern, at the cost of the colour scale's meaning shifting
+    between views -- which is exactly why the legend discloses the actual
+    numeric range being shown, rather than leaving "red" ambiguous.
+    "fixed" always maps the literal 0.0-1.0 probability range, so colours
+    stay directly comparable across different lead days/views.
+    """
+    values = lead_df["bust_probability"].to_numpy(dtype=float)
+    if scale_mode == "adaptive":
+        vmin = float(np.percentile(values, 2))
+        vmax = float(np.percentile(values, 98))
+        if vmax - vmin < 1e-6:
+            vmin, vmax = float(values.min()), float(values.max())
+        if vmax - vmin < 1e-6:
+            vmax = vmin + 1e-6
+    else:
+        vmin, vmax = 0.0, 1.0
+    return vmin, vmax
+
+
+def _apply_risk_gradient(normalized: np.ndarray) -> np.ndarray:
+    """Map values already normalised to [0, 1] through the green->amber->red
+    gradient, returning an (H, W, 4) uint8 RGBA array."""
+    stops = [(0.0, (46, 125, 50)), (0.5, (249, 199, 79)), (1.0, (198, 40, 40))]
+    rgba = np.zeros((*normalized.shape, 4), dtype=np.uint8)
+    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+        mask = (normalized >= p0) & (normalized <= p1)
+        denom = (p1 - p0) if p1 > p0 else 1.0
+        t = (normalized[mask] - p0) / denom
+        for ch in range(3):
+            rgba[..., ch][mask] = (c0[ch] + (c1[ch] - c0[ch]) * t).astype(np.uint8)
+    rgba[..., 3] = 210  # semi-opaque, so basemap labels remain legible underneath
+    return rgba
+
+
+def build_probability_raster(
+    lead_df: pd.DataFrame, vmin: float, vmax: float, india_geom, upsample: int = 4
+) -> Tuple[np.ndarray, List[List[float]]]:
+    """Rasterise bust_probability into a smooth, georeferenced RGBA image for
+    a folium ImageOverlay, using the given [vmin, vmax] color-scale range
+    (see ``compute_color_scale_range``), clipped to India's actual national
+    boundary (not the full rectangular data grid).
+
+    The grid is a REGULAR 0.5-degree lattice, not scattered points -- so a
+    point-based heat-blob layer (folium.plugins.HeatMap) is the wrong tool:
+    at country-scale zoom its fixed pixel radius doesn't fully bridge the
+    gaps between grid columns/rows, producing visible banding artifacts.
+    Rendering our own raster avoids that entirely and looks smooth at any
+    zoom level, since Leaflet stretches a single image rather than
+    accumulating thousands of individual blobs.
+
+    ``lead_df`` should be the FULL (unmasked) grid, not just the India-only
+    subset: the smooth field is interpolated from complete rectangular
+    coverage first, then clipped to the real border as a final step -- this
+    avoids interpolation holes/artifacts right at the coastline that would
+    appear if the input itself already had India-external points removed.
+    """
+    lats = np.sort(lead_df["lat"].unique())
+    lons = np.sort(lead_df["lon"].unique())
+    grid = lead_df.pivot_table(index="lat", columns="lon", values="bust_probability", aggfunc="mean")
+    grid = grid.reindex(index=lats, columns=lons)
+    grid_vals = np.nan_to_num(grid.to_numpy(dtype=float), nan=0.0)
+
+    # Row 0 of an image is its TOP (north) edge; our grid was built with lat
+    # ascending (south -> north), so flip vertically to match.
+    grid_vals = np.flipud(grid_vals)
+
+    normalized = np.clip((grid_vals - vmin) / (vmax - vmin), 0.0, 1.0)
+
+    # Upsample + lightly smooth so the coarse 0.5 deg lattice reads as a
+    # continuous risk surface rather than a blocky pixel grid.
+    smooth = ndi_zoom(normalized, upsample, order=3)
+    smooth = gaussian_filter(smooth, sigma=1.0)
+    smooth = np.clip(smooth, 0.0, 1.0)
+
+    rgba = _apply_risk_gradient(smooth)
+
+    # Clip to India's real border: build a lat/lon coordinate for every pixel
+    # of the upsampled image and hide (alpha=0) anything outside the polygon.
+    lat_min, lat_max, lon_min, lon_max = float(lats.min()), float(lats.max()), float(lons.min()), float(lons.max())
+    out_h, out_w = smooth.shape
+    pixel_lats = np.linspace(lat_max, lat_min, out_h)  # row 0 = north, matching the flip above
+    pixel_lons = np.linspace(lon_min, lon_max, out_w)
+    lon_grid, lat_grid = np.meshgrid(pixel_lons, pixel_lats)
+    inside_india = shapely.contains_xy(india_geom, lon_grid, lat_grid)
+    rgba[..., 3] = np.where(inside_india, rgba[..., 3], 0)
+
+    bounds = [[lat_min, lon_min], [lat_max, lon_max]]
+    return rgba, bounds
 
 
 def find_nearest_grid_point(lead_df: pd.DataFrame, lat: float, lon: float) -> Optional[pd.Series]:
@@ -347,49 +486,56 @@ def render_kpi_cards(lead_df: pd.DataFrame, alert_threshold: float) -> None:
 # ===========================================================================
 
 
-def render_map(lead_df: pd.DataFrame, map_mode: str, key: str):
-    center_lat, center_lon = float(lead_df["lat"].mean()), float(lead_df["lon"].mean())
+def render_map(lead_df_full: pd.DataFrame, lead_df_india: pd.DataFrame, map_mode: str, vmin: float, vmax: float, india_geom, key: str) -> dict:
+    """``lead_df_full`` is the FULL (unmasked) grid, needed only as the
+    raster's interpolation input (see build_probability_raster).
+    ``lead_df_india`` is the India-only subset (with dominant_risk_factor
+    already attached by the caller) used for the point-marker mode."""
+    center_lat, center_lon = float(lead_df_india["lat"].mean()), float(lead_df_india["lon"].mean())
     m = folium.Map(location=[center_lat, center_lon], zoom_start=5, tiles="OpenStreetMap", control_scale=True)
 
     if map_mode == "Heatmap (recommended)":
-        heat_data = lead_df[["lat", "lon", "bust_probability"]].values.tolist()
-        HeatMap(
-            heat_data, radius=16, blur=12, max_zoom=6, min_opacity=0.35,
-            gradient={"0.0": "#2e7d32", "0.5": "#f9c74f", "0.8": "#ef6c00", "1.0": "#c62828"},
-        ).add_to(m)
+        rgba, bounds = build_probability_raster(lead_df_full, vmin, vmax, india_geom)
+        ImageOverlay(image=rgba, bounds=bounds, opacity=0.78, interactive=False, cross_origin=False).add_to(m)
     else:
-        # Decimated grid points so the browser only has to render a few
-        # hundred vector markers (with hover tooltips) instead of ~4,000.
-        lats = np.sort(lead_df["lat"].unique())
-        lons = np.sort(lead_df["lon"].unique())
+        # Decimated grid points (India-only) so the browser only has to
+        # render a few hundred vector markers (with hover tooltips) instead
+        # of thousands, and never a marker sitting in a neighbouring country.
+        lats = np.sort(lead_df_india["lat"].unique())
+        lons = np.sort(lead_df_india["lon"].unique())
         keep_lat = set(lats[::2])
         keep_lon = set(lons[::2])
-        sampled = lead_df[lead_df["lat"].isin(keep_lat) & lead_df["lon"].isin(keep_lon)]
+        sampled = lead_df_india[lead_df_india["lat"].isin(keep_lat) & lead_df_india["lon"].isin(keep_lon)]
         for row in sampled.itertuples():
             folium.CircleMarker(
                 location=[row.lat, row.lon],
                 radius=5,
                 color=None,
                 fill=True,
-                fill_color=bust_prob_to_hex(row.bust_probability),
+                fill_color=bust_prob_to_hex(row.bust_probability, vmin, vmax),
                 fill_opacity=0.8,
                 weight=0,
                 tooltip=(
                     f"({row.lat:.1f}, {row.lon:.1f})<br>"
-                    f"Bust probability: {row.bust_probability:.2f}<br>"
+                    f"Bust probability: {row.bust_probability:.3f}<br>"
                     f"Confidence: {row.confidence_pct:.0f}%<br>"
                     f"Driver: {row.dominant_risk_factor}<br>"
                     f"Region: {row.region_display}"
                 ),
             ).add_to(m)
 
-    return st_folium(m, height=560, use_container_width=True, key=key, returned_objects=["last_clicked"])
+    map_data = st_folium(m, height=560, use_container_width=True, key=key, returned_objects=["last_clicked"])
+    return map_data
 
 
-def render_map_legend() -> None:
+def render_map_legend(vmin: float, vmax: float, scale_mode: str) -> None:
+    if scale_mode == "adaptive":
+        caption = f"Adaptive scale for this view: {vmin:.3f} (green) &rarr; {vmax:.3f} (red)"
+    else:
+        caption = f"Fixed scale: {vmin:.2f} (green) &rarr; {vmax:.2f} (red)"
     st.markdown(
-        """<div class="legend-row">
-            <span>Low risk</span><span class="legend-gradient"></span><span>Critical bust risk</span>
+        f"""<div class="legend-row">
+            <span>{caption}</span><span class="legend-gradient"></span>
         </div>""",
         unsafe_allow_html=True,
     )
@@ -550,7 +696,7 @@ def main() -> None:
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
     try:
-        artifact, df, case_meta, heatwave_threshold = load_model_and_data()
+        artifact, df, case_meta, heatwave_threshold, india_geom = load_model_and_data()
     except FileNotFoundError as exc:
         st.error(
             f"Could not load a required file: {exc}\n\n"
@@ -575,6 +721,13 @@ def main() -> None:
 
         st.markdown("### 🗺️ Map Display")
         map_mode = st.radio("Layer style", ["Heatmap (recommended)", "Grid Points (sampled)"], index=0)
+        scale_mode_label = st.radio(
+            "Colour scale", ["Adaptive (relative to this view)", "Fixed (0.00 - 1.00 absolute)"], index=0,
+            help="Adaptive stretches green->red to this view's own risk range -- useful because short "
+                 "lead times are often uniformly low-risk and would otherwise look flat green. Fixed keeps "
+                 "colours directly comparable across different lead days.",
+        )
+        scale_mode = "adaptive" if scale_mode_label.startswith("Adaptive") else "fixed"
 
         st.markdown("---")
         with st.expander("ℹ️ About this prototype"):
@@ -584,40 +737,47 @@ def main() -> None:
                 "The 'Synoptic Event Filter' selects among archived synthetic forecast cases whose "
                 "dominant regime matches the chosen scenario; 'Heat Wave' is a derived proxy "
                 "(quiescent regime + T2m above the 90th percentile) since heat waves are not a "
-                "separately modelled synoptic regime in the generator."
+                "separately modelled synoptic regime in the generator.\n\n"
+                "The underlying data grid is a rectangular lat/lon box (6-38N, 68-98E) that is only "
+                "~28% India by area -- the map and every statistic below are clipped/filtered to India's "
+                "actual national boundary (mainland + island territories), not the full rectangle."
             )
 
-    # --- Resolve which archived case to show ---
+    # --- Resolve which archived case to show (India-only case statistics) ---
     chosen_init_time = select_case_init_time(case_meta, event_filter, heatwave_threshold)
     if chosen_init_time is None:
         st.warning(f"No archived case matches '{event_filter}' in the current dataset -- showing the live forecast cycle instead.")
         chosen_init_time = latest_init_time
 
     case_df = df[df["init_time"] == chosen_init_time]
+    case_df_india = case_df[case_df["is_india"]]
     case_regime = case_df["regime"].iloc[0] if len(case_df) else "quiescent"
-    lead_df = case_df[case_df["lead_day"] == lead_day].copy()
+
+    lead_df = case_df[case_df["lead_day"] == lead_day].copy()  # full rectangle: raster interpolation input only
+    lead_df_india = lead_df[lead_df["is_india"]].copy()  # every statistic below uses this
 
     cache_key = f"{chosen_init_time}_{lead_day}"
-    lead_df["dominant_risk_factor"] = compute_dominant_factors_for_case(artifact, lead_df, cache_key)
+    lead_df_india["dominant_risk_factor"] = compute_dominant_factors_for_case(artifact, lead_df_india, cache_key)
 
     st.markdown(
         f"""<div class="scenario-banner">
             Showing forecast cycle initialized <b>{chosen_init_time}</b> &nbsp;|&nbsp;
             Dominant synoptic regime: <b>{REGIME_DISPLAY_SHORT.get(case_regime, case_regime)}</b> &nbsp;|&nbsp;
             Lead time: <b>Day {lead_day}</b> &nbsp;|&nbsp;
-            Grid points: <b>{len(lead_df):,}</b>
+            Grid points in India: <b>{len(lead_df_india):,}</b>
         </div>""",
         unsafe_allow_html=True,
     )
 
     # --- KPI cards ---
-    render_kpi_cards(lead_df, alert_threshold)
+    render_kpi_cards(lead_df_india, alert_threshold)
     st.write("")
 
     # --- Map ---
     st.markdown('<p class="section-title">Forecast Bust Probability &mdash; India</p>', unsafe_allow_html=True)
-    render_map_legend()
-    map_data = render_map(lead_df, map_mode, key=f"map_{cache_key}_{map_mode}")
+    vmin, vmax = compute_color_scale_range(lead_df_india, scale_mode)
+    render_map_legend(vmin, vmax, scale_mode)
+    map_data = render_map(lead_df, lead_df_india, map_mode, vmin, vmax, india_geom, key=f"map_{cache_key}_{map_mode}_{scale_mode}")
 
     map_click = None
     if map_data:
@@ -628,12 +788,13 @@ def main() -> None:
 
     st.write("")
 
-    # --- Drill-down / XAI ---
-    render_drill_down(artifact, lead_df, map_click)
+    # --- Drill-down / XAI (India-only, so a click in a neighbouring country
+    # still snaps to the nearest genuine India grid point) ---
+    render_drill_down(artifact, lead_df_india, map_click)
     st.write("")
 
-    # --- Lead-time decay ---
-    render_lead_time_decay(case_df, lead_day)
+    # --- Lead-time decay (India-only) ---
+    render_lead_time_decay(case_df_india, lead_day)
 
     st.markdown(
         '<p class="footer-note">NCMRWF Forecast Bust Detection &mdash; Prototype for Smart India Hackathon 2026. '
