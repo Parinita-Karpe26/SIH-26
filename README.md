@@ -1,54 +1,119 @@
-Glad it's rendering correctly now — that's a proper India outline with the Northeast (Assam/Arunachal) states also showing color, which is right since they're genuinely part of the dataset. Here's a full walkthrough of everything on the page, what it does, and what's actually happening behind it.
+## Dashboard walkthrough
 
-## The big picture
+### What's behind it
 
-Everything you see is driven by one pre-trained model (`bust_detector.pkl`) and one dataset (`processed_features.parquet`). On startup, the app loads both **once**, runs the model across the whole dataset to get a `bust_probability` for every grid point/lead-day, and caches that in memory. Every widget you touch afterward just filters or re-slices that cached result — nothing gets retrained or reloaded as you interact.
+The dashboard runs on two files: a trained model (`models/bust_detector.pkl`) and a
+dataset (`data/processed_features_real.parquet`). The dataset is built from real
+NCMRWF IMDAA reanalysis for July–August 2019: daily maximum temperature, daily rainfall
+and 850 hPa winds, averaged onto a ~0.5° grid over India.
 
-## Header bar
+IMDAA tells us what the weather actually did, but it doesn't contain forecasts. So for
+now we check a simple reference forecast, *persistence* ("the weather on Day N will
+look like today"), which is the standard baseline in forecast verification. A forecast
+counts as a **bust** if it misses maximum temperature by more than 5 °C or rainfall by
+more than 50 mm. The next stage swaps persistence for NCMRWF's own S2S model forecasts;
+that pipeline is already built.
 
-Static branding plus three live status pills: which model type is loaded (XGBoost), which forecast cycle is "current" (the most recent date in the dataset), and the server's current time. This is cosmetic/status only — it doesn't respond to your controls.
+When the app starts, it loads the model and data once, scores every grid point for every
+forecast cycle and lead day, and keeps the results in memory. Everything you click after
+that just picks a different slice. Nothing is retrained while you use it.
 
-## Sidebar — Forecast Controls
+### Header
 
-- **Lead Time slider (Day 1–10):** picks which of the 10 forecast lead times to display. Moving it re-filters the cached predictions to that lead day — no recomputation of the model itself, just a different slice.
-- **Synoptic Event Filter:** this is the more interesting one. It doesn't filter *within* the current forecast — it **switches which archived forecast case you're looking at entirely**. Our synthetic dataset has 36 different forecast dates spread across a year, each dominated by one weather pattern (monsoon trough, western disturbance, Bay of Bengal cyclone, or quiescent). Picking "Monsoon Depression" finds the most recent archived case tagged as a Bay-of-Bengal cyclone and shows *that* case's full Day 1–10 forecast instead. "Heat Wave" is flagged in the UI as a **derived proxy** (quiescent regime + top-10% temperature) since our generator never modeled a true heat-wave pattern — that's disclosed honestly in the "About" panel rather than hidden.
+Shows which model is loaded, which forecast cycle you're viewing, where the data comes
+from, and the server time. It's for orientation only; none of it reacts to the controls.
 
-## Sidebar — Alerting
+### Sidebar: forecast controls
 
-- **Alert Threshold slider:** this is the probability cutoff for "is this officially a bust risk or not." It only affects two things: the "High-Risk Area %" KPI and the "Alert Regions" KPI. It does **not** change the map's colors — the map always shows the raw continuous probability, not a pass/fail flag.
+- **Synoptic regime filter.** Narrows the list of forecast cycles to one type of weather
+  situation, such as an active monsoon trough or a low over the Bay of Bengal. Only
+  situations that actually occur in the data are listed. The labels come from a simple
+  rule (rainfall over central India and circulation over the Bay), not an official
+  IMD classification.
+- **Forecast cycle (issue date).** Chooses which day the forecast was issued. Each entry
+  shows how many lead days can be checked and the weather situation that day. Cycles near
+  the end of the dataset have fewer lead days, because we can only check a forecast
+  against days we have observations for. The dashboard opens on a cycle with the full
+  Day 1–10 range.
+- **Lead time.** Chooses how many days ahead you're looking. The slider only offers lead
+  days that exist for the chosen cycle.
 
-## Sidebar — Map Display
+### Sidebar: alerting
 
-- **Layer style (Heatmap / Grid Points):** Heatmap renders a smooth, continuous color surface (technically a rasterized image, not individual blobs — this is the fix from a couple of messages ago). Grid Points instead draws individual dots you can hover over for exact numbers, sampled to keep the browser fast.
-- **Colour scale (Adaptive / Fixed):** Adaptive stretches green→red to whatever range of risk actually exists *in the view you're currently looking at* — this is why the legend right above the map literally prints the numbers it's using (e.g., "0.001 → 0.003" in your screenshot). Without this, Day 1–5 forecasts would look uniformly flat green, since real risk at short lead times is genuinely tiny. Fixed instead always uses the literal 0.00–1.00 probability scale, so colors mean the same thing across every lead day — useful if you want strict comparability rather than "what's relatively worse right now."
+- **Alert threshold.** The probability above which a grid point counts as a likely bust.
+  It starts at the model's own operating threshold, the value that gave the best balance
+  of hits and false alarms on validation days. It affects the high-risk area, alert
+  regions and dominant-driver cards. The map colours don't change, because the map
+  always shows the underlying probability.
 
-## Scenario banner
+### Sidebar: map display
 
-The blue strip confirming exactly what you're looking at: which date this forecast was issued, what weather regime dominates it, which lead day, and how many actual India grid points are included (not the full rectangle — see below).
+- **Layer style.** *Heatmap* draws a smooth colour surface. *Grid points* draws individual
+  points you can hover over for exact values (a sample, to keep the browser responsive).
+- **Colour scale.** *Adaptive* stretches green-to-red across whatever range of risk exists
+  in the current view, and the legend shows the exact range used. This matters at short
+  lead times, where risk is low almost everywhere and a fixed scale would look uniformly
+  green. *Fixed* always uses 0–1, so colours mean the same thing across lead days.
 
-## KPI cards
+### Scenario banner
 
-- **High-Risk Area (% of India):** the share of India's grid cells whose probability is at or above your Alert Threshold.
-- **Avg. System Confidence:** the mean of `(1 − bust_probability) × 100` across all of India for this view.
-- **Alert Regions:** how many of the 5 macro-zones (North/South/East/West/Central India) have a meaningful chunk of flagged high-risk points.
-- **Dominant Risk Driver:** the single most common SHAP-identified cause of risk across all flagged points right now (e.g., "Extended lead time," "Active low-pressure system"). This comes from actually running SHAP over the visible grid, not a hardcoded label.
+A one-line summary of what you're looking at: when the forecast was issued, which day
+it's valid for, the weather situation, the lead day, and how many grid points inside
+India are included.
 
-## The map itself
+### Summary cards
 
-The color field is now clipped to India's real political boundary (a locally-shipped GeoJSON), not the old rectangular data box — that was the fix for the Pakistan/China/ocean bleed you flagged. You can click anywhere on the map; if a browser click registers, it snaps to the nearest real India grid point and feeds it into the drill-down section below instead of whatever the region dropdown had selected.
+- **High-risk area.** The share of India's grid points at or above the alert threshold.
+- **Average system confidence.** The average of (1 − bust probability) × 100 across India.
+- **Alert regions.** How many of the five zones (North, South, East, West, Central) have a
+  meaningful share of flagged points.
+- **Dominant risk driver.** The most common reason, according to SHAP, behind the flagged
+  points, for example "Sharp temperature swing". It's worked out live from the grid
+  you're viewing, not a fixed label.
 
-## Drill-Down & XAI Inspector
+### The map
 
-- **Region dropdown:** defaults to whichever region currently has the *lowest* average confidence — i.e., it auto-points you at the most concerning area without you having to hunt for it. Picking a region shows its single highest-risk grid point (not an average — the point a duty officer would actually want to see).
-- **Waterfall / Bar Chart tabs:** both show the same underlying SHAP explanation for that one point, just two visual styles. The waterfall shows how you get from the model's average baseline probability up (or down) to this specific point's prediction, feature by feature. The bar chart just ranks the same features by impact, red = pushes risk up, green = pushes it down.
-- **Meteorologist Guidance Summary:** a plain-English sentence generated from those same SHAP values (e.g., "Confidence degraded to 12% primarily due to an active low-pressure system near the Bay of Bengal coastal belt..."). This is template-composed from the top 1–2 real contributing features, not a canned string — it changes based on whatever point you're actually looking at.
+The risk surface is clipped to India's boundary (`app/assets/india_boundary.geojson`), so
+nothing spills over neighbouring countries or the sea. Click anywhere and the inspector
+below jumps to the nearest grid point.
 
-## Lead-Time Confidence Decay chart
+### Drill-down and explanation
 
-A Plotly line chart showing how average confidence falls off from Day 1 to Day 10, one line per macro-zone, for whichever scenario is currently selected. The dashed vertical line marks whatever lead day your slider is currently on, so you can see where "today's" view sits on that decay curve.
+- **Region selector.** Opens on the region with the lowest average confidence, so you
+  start where things look worst. It then shows that region's single highest-risk point,
+  which is the one a duty officer would actually want to look at.
+- **Waterfall / bar chart.** Two views of the same explanation for that point. The
+  waterfall builds up from the model's average prediction to this point's prediction,
+  one factor at a time. The bar chart ranks factors by impact: red pushes risk up, green
+  pushes it down.
+- **Meteorologist guidance summary.** A plain-English sentence built from the top
+  factors, for example: *"Confidence degraded to 18% primarily due to a sharp 1-day swing
+  in maximum temperature and strong 850 hPa convergence, during an active monsoon
+  trough over the Indo-Gangetic Plain."* It changes with every point you select.
 
-## Footer
+### Confidence by lead time
 
-Just the synthetic-data disclaimer, restated for anyone who scrolls straight to the bottom.
+A chart of how average confidence falls as lead time grows, one line per zone, for the
+selected cycle. A dashed line marks the lead day you're currently viewing.
 
-A good way to demo this to judges: start on "Live Forecast Cycle" at Day 1 (flat, high confidence), drag the lead slider to Day 10 (watch the map develop texture and the decay chart drop), then switch the Event Filter to "Monsoon Depression" to show it's a genuinely different archived storm, and finish by clicking a red patch on the map to pull up its SHAP explanation live.
+### Good to know
+
+- **Treat confidence as a ranking.** The probabilities rank risk well, but they aren't
+  calibrated yet: the model leans towards flagging risk, so a point shown at 60% busts
+  less often than 60% of the time. Use the numbers to compare places and lead days, not
+  as exact odds.
+- **This is a prototype,** not an official MoES/NCMRWF product.
+
+### Suggested demo
+
+1. Open the first cycle at **Day 1**: the map is mostly calm and confidence is high.
+2. Drag the lead time towards **Day 9–10**: risk builds up across the map and the
+   confidence chart falls.
+3. Switch the **forecast cycle** or **regime filter** to show a different weather
+   situation.
+4. Click a **red area** on the map to bring up its explanation live.
+
+### Running it
+
+    uvicorn app.api:app --reload        # API (takes ~30 s to start)
+    streamlit run app/dashboard.py      # dashboard, in a second terminal
