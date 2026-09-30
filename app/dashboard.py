@@ -12,11 +12,13 @@ here" drill-down with a plain-English guidance summary.
 ------------------------------------------------------------------------------
 DATA / CACHING STRATEGY
 ------------------------------------------------------------------------------
-Unlike ``app/api.py`` (which only ever serves the single most recent forecast
-cycle), this dashboard lets a duty officer explore DIFFERENT archived
-scenarios via the "Synoptic Event Filter" (Monsoon Depression / Western
-Disturbance / Heat Wave / Normal). That needs predictions across the WHOLE
-dataset, not just the latest cycle -- so the caching is split in two tiers:
+Unlike ``app/api.py`` (which serves one forecast cycle), this dashboard lets
+a duty officer explore EVERY forecast cycle in the real IMDAA dataset
+(issued 1-9 July 2019), filtered by synoptic regime. Note that later cycles
+have fewer verifiable lead days (the 07-09 cycle only has Day 1, because the
+data ends on 07-10), so the lead-day slider adapts to the chosen cycle. That
+needs predictions across the WHOLE dataset -- so the caching is split in two
+tiers:
 
   1. ``load_model_and_data()`` (``st.cache_resource``, runs once per server
      process): loads the model, loads the full processed-features dataset,
@@ -49,7 +51,7 @@ From the project root (the folder containing app/, data/, models/):
     streamlit run app/dashboard.py
 
 Environment overrides (same as app/api.py):
-    BUST_DATA_PATH   -- path to processed_features.parquet
+    BUST_DATA_PATH   -- path to the dataset (default data/processed_features_real.parquet)
     BUST_MODEL_PATH  -- path to bust_detector.pkl
 ==============================================================================
 """
@@ -107,19 +109,25 @@ REGION_DISPLAY_NAMES: Dict[str, str] = {
 REGION_DISPLAY_TO_CODE = {v: k for k, v in REGION_DISPLAY_NAMES.items()}
 
 REGIME_DISPLAY_SHORT: Dict[str, str] = {
-    "monsoon_trough": "Monsoon Trough",
+    "monsoon_trough": "Active Monsoon Trough",
+    "monsoon_break": "Weak / Break Monsoon",
+    "bay_of_bengal_low": "Bay of Bengal Monsoon Low",
     "western_disturbance": "Western Disturbance",
     "bay_of_bengal_cyclone": "Bay of Bengal Depression / Cyclone",
     "quiescent": "Quiescent / Normal Conditions",
 }
 
-EVENT_FILTER_OPTIONS = [
-    "Live Forecast Cycle (current)",
-    "Monsoon Depression",
-    "Western Disturbance",
-    "Heat Wave (derived)",
-    "Normal / Quiescent",
-]
+ALL_REGIMES_OPTION = "All forecast cycles"
+# Filter label -> regime codes it matches (covers both the real IMDAA regimes
+# and the older synthetic ones, so either dataset works).
+EVENT_FILTER_REGIMES: Dict[str, List[str]] = {
+    ALL_REGIMES_OPTION: [],
+    "Bay of Bengal Monsoon Low / Depression": ["bay_of_bengal_low", "bay_of_bengal_cyclone"],
+    "Active Monsoon Trough": ["monsoon_trough"],
+    "Weak / Break Monsoon": ["monsoon_break"],
+    "Western Disturbance": ["western_disturbance"],
+    "Quiescent": ["quiescent"],
+}
 
 RISK_LEVEL_COLORS = {"Low": "#2e7d32", "Moderate": "#f9a825", "High": "#ef6c00", "Severe": "#c62828"}
 MACRO_ZONES = ["North", "South", "East", "West", "Central"]
@@ -242,51 +250,44 @@ def load_model_and_data():
     india_geom = load_india_geometry()
     df["is_india"] = shapely.contains_xy(india_geom, df["lon"].to_numpy(dtype=float), df["lat"].to_numpy(dtype=float))
 
-    # Every statistic (case-scenario matching, KPIs, region confidence,
-    # drill-down defaults, decay chart) is computed from India-only points;
-    # the full (unmasked) df is kept only so the map's raster field has
-    # complete spatial coverage to interpolate from before being visually
-    # clipped to the real border -- see build_probability_raster.
-    df_india = df[df["is_india"]]
+    # KPIs, region confidence, drill-down defaults and the decay chart are
+    # computed from India-only points (is_india); the full (unmasked) df is
+    # kept so the map's raster field has complete spatial coverage to
+    # interpolate from before being clipped to the real border -- see
+    # build_probability_raster. Case metadata (regime, lead days) is a
+    # property of the whole forecast cycle, so it uses the full grid.
 
     case_meta = (
-        df_india.groupby("init_time")
-        .agg(regime=("regime", "first"), max_T2m=("T2m", "max"), mean_T2m=("T2m", "mean"))
+        df.groupby("init_time", observed=True)
+        .agg(regime=("regime", "first"), n_leads=("lead_day", "nunique"), max_lead=("lead_day", "max"))
         .reset_index()
         .sort_values("init_time")
     )
-    heatwave_threshold = float(df_india["T2m"].quantile(0.90))
+    case_meta["regime"] = case_meta["regime"].astype(str)
 
-    return artifact, df, case_meta, heatwave_threshold, india_geom
+    return artifact, df, case_meta, india_geom
 
 
 @st.cache_data(show_spinner="Computing SHAP-based risk drivers for this forecast view ...")
 def compute_dominant_factors_for_case(_artifact: dict, _case_df: pd.DataFrame, cache_key: str) -> list:
+    if len(_case_df) == 0:
+        return []
     X = xai.encode_dataframe(_case_df, _artifact)
     return bust_api.compute_dominant_risk_factor(_artifact, X)
 
 
-def select_case_init_time(case_meta: pd.DataFrame, event_filter: str, heatwave_threshold: float) -> Optional[pd.Timestamp]:
-    """Pick which archived forecast case (init_time) to display for the
-    selected scenario filter -- the most recent case whose regime (and, for
-    the Heat Wave proxy, peak temperature) matches. ``case_meta`` is
-    computed from India-only grid points, so e.g. the Heat Wave threshold
-    reflects India's own temperatures, not a neighboring desert's."""
-    if event_filter == "Live Forecast Cycle (current)":
-        return case_meta["init_time"].max()
-    if event_filter == "Monsoon Depression":
-        candidates = case_meta.loc[case_meta["regime"] == "bay_of_bengal_cyclone", "init_time"]
-    elif event_filter == "Western Disturbance":
-        candidates = case_meta.loc[case_meta["regime"] == "western_disturbance", "init_time"]
-    elif event_filter == "Heat Wave (derived)":
-        candidates = case_meta.loc[(case_meta["regime"] == "quiescent") & (case_meta["max_T2m"] >= heatwave_threshold), "init_time"]
-    elif event_filter == "Normal / Quiescent":
-        candidates = case_meta.loc[(case_meta["regime"] == "quiescent") & (case_meta["max_T2m"] < heatwave_threshold), "init_time"]
-    else:
-        candidates = case_meta["init_time"]
-    if len(candidates) == 0:
-        return None
-    return candidates.max()
+def candidate_cases(case_meta: pd.DataFrame, event_filter: str) -> pd.DataFrame:
+    """Forecast cycles whose regime matches the selected filter."""
+    regimes = EVENT_FILTER_REGIMES.get(event_filter, [])
+    if not regimes:
+        return case_meta
+    return case_meta[case_meta["regime"].isin(regimes)]
+
+
+def format_case_label(row: pd.Series) -> str:
+    regime = REGIME_DISPLAY_SHORT.get(row["regime"], row["regime"])
+    leads = "Day 1 only" if int(row["max_lead"]) == 1 else f"Day 1-{int(row['max_lead'])}"
+    return f"{pd.Timestamp(row['init_time']).date()} · {leads} · {regime}"
 
 
 def bust_prob_to_hex(p: float, vmin: float = 0.0, vmax: float = 1.0) -> str:
@@ -438,7 +439,8 @@ def render_header(artifact: dict, forecast_init_time) -> None:
           <div class="ncmrwf-header-right">
             <span class="status-pill status-ok">&#9679; SYSTEM OPERATIONAL</span>
             <span class="status-pill">Model: {artifact['model_type'].upper()}</span>
-            <span class="status-pill">Forecast Cycle: {forecast_init_time}</span>
+            <span class="status-pill">Forecast Cycle: {pd.Timestamp(forecast_init_time).date()}</span>
+            <span class="status-pill">Data: IMDAA reanalysis</span>
             <span class="status-pill">Server: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</span>
           </div>
         </div>
@@ -471,7 +473,8 @@ def render_kpi_cards(lead_df: pd.DataFrame, alert_threshold: float) -> None:
     zone_alert_frac = lead_df.groupby("macro_zone")["bust_probability"].apply(lambda s: (s >= alert_threshold).mean())
     alert_regions = sorted(zone_alert_frac[zone_alert_frac > 0.01].index.tolist())
 
-    driver_counts = lead_df.loc[lead_df["dominant_risk_factor"] != bust_api.NO_RISK_LABEL, "dominant_risk_factor"].value_counts()
+    flagged = lead_df[(lead_df["bust_probability"] >= alert_threshold) & (lead_df["dominant_risk_factor"] != bust_api.NO_RISK_LABEL)]
+    driver_counts = flagged["dominant_risk_factor"].value_counts()
     top_driver = driver_counts.index[0] if len(driver_counts) else bust_api.NO_RISK_LABEL
 
     c1, c2, c3, c4 = st.columns(4)
@@ -669,8 +672,8 @@ def render_drill_down(artifact: dict, lead_df: pd.DataFrame, map_click: Optional
 def render_lead_time_decay(case_df: pd.DataFrame, selected_lead_day: int) -> None:
     st.markdown('<p class="section-title">Lead-Time Confidence Decay</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="section-caption">Average forecast confidence by region as lead time extends from Day 1 to Day 10, '
-        "for the currently displayed scenario.</p>",
+        '<p class="section-caption">Average forecast confidence by zone as lead time extends, '
+        "for the currently displayed forecast cycle (only lead days that can be verified against the data are shown).</p>",
         unsafe_allow_html=True,
     )
 
@@ -696,27 +699,49 @@ def main() -> None:
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
     try:
-        artifact, df, case_meta, heatwave_threshold, india_geom = load_model_and_data()
+        artifact, df, case_meta, india_geom = load_model_and_data()
     except FileNotFoundError as exc:
         st.error(
             f"Could not load a required file: {exc}\n\n"
-            "Run `generate_data_and_features.py` then `train_model.py` first, "
+            "Run `generate_data_and_features_real.py` then `train_model.py` first, "
             "or set the BUST_DATA_PATH / BUST_MODEL_PATH environment variables."
         )
         st.stop()
 
-    latest_init_time = df["init_time"].max()
-    render_header(artifact, latest_init_time)
+    model_threshold = float(artifact.get("operating_threshold", 0.5))
 
     # --- Sidebar controls ---
     with st.sidebar:
         st.markdown("### 🎛️ Forecast Controls")
-        lead_day = st.slider("Lead Time (Forecast Day)", min_value=1, max_value=10, value=3, step=1)
-        event_filter = st.selectbox("Synoptic Event Filter", EVENT_FILTER_OPTIONS, index=0)
+        present = set(case_meta["regime"])
+        filter_options = [k for k, v in EVENT_FILTER_REGIMES.items() if not v or present & set(v)]  # only regimes in the data
+        event_filter = st.selectbox("Synoptic Regime Filter", filter_options, index=0)
+        cands = candidate_cases(case_meta, event_filter)
+        if len(cands) == 0:
+            st.warning(f"No forecast cycle matches '{event_filter}' -- showing all cycles.")
+            cands = case_meta
+        cands = cands.reset_index(drop=True)
+        # Default: the cycle with the most verifiable lead days (earliest issue date)
+        default_case = int(cands["n_leads"].to_numpy().argmax())
+        case_idx = st.selectbox(
+            "Forecast cycle (issue date)", range(len(cands)), index=default_case,
+            format_func=lambda i: format_case_label(cands.iloc[i]),
+            help="Later cycles have fewer lead days because the dataset ends on its last observation day.",
+        )
+        chosen_init_time = cands.iloc[case_idx]["init_time"]
+        case_df = df[df["init_time"] == chosen_init_time]
+        available_leads = sorted(int(x) for x in case_df["lead_day"].unique())
+        if len(available_leads) > 1:
+            lead_day = st.select_slider("Lead Time (Forecast Day)", options=available_leads, value=min(3, available_leads[-1]))
+        else:
+            lead_day = available_leads[0]
+            st.caption(f"This cycle can only be verified at Day {lead_day}.")
 
         st.markdown("### ⚠️ Alerting")
         alert_threshold = st.slider(
-            "Alert Threshold (flag as bust if P \u2265 threshold)", min_value=0.0, max_value=1.0, value=0.65, step=0.01,
+            "Alert Threshold (flag as bust if P \u2265 threshold)", min_value=0.0, max_value=1.0,
+            value=round(model_threshold, 2), step=0.01,
+            help=f"Defaults to the model's best-F1 operating threshold ({model_threshold:.2f}), chosen on the validation day.",
         )
 
         st.markdown("### 🗺️ Map Display")
@@ -732,36 +757,35 @@ def main() -> None:
         st.markdown("---")
         with st.expander("ℹ️ About this prototype"):
             st.write(
-                "This dashboard is served from a fully **synthetic** NWP + ensemble-spread dataset "
-                "generated for the SIH 2026 prototype (not live NCMRWF operational data). "
-                "The 'Synoptic Event Filter' selects among archived synthetic forecast cases whose "
-                "dominant regime matches the chosen scenario; 'Heat Wave' is a derived proxy "
-                "(quiescent regime + T2m above the 90th percentile) since heat waves are not a "
-                "separately modelled synoptic regime in the generator.\n\n"
-                "The underlying data grid is a rectangular lat/lon box (6-38N, 68-98E) that is only "
-                "~28% India by area -- the map and every statistic below are clipped/filtered to India's "
-                "actual national boundary (mainland + island territories), not the full rectangle."
+                "**Data:** real NCMRWF **IMDAA reanalysis** (daily max 2 m temperature, daily rainfall, "
+                "850 hPa winds), 1-10 July 2019, averaged to a ~0.5\u00b0 grid.\n\n"
+                "**Forecast being checked:** a *persistence* forecast (\"the forecast for Day N is "
+                "what was observed on the issue day\") -- the standard reference forecast in verification. "
+                "The supplied files contain no NWP forecasts yet.\n\n"
+                "**Bust:** |max-temperature error| > 5 \u00b0C or |24 h rainfall error| > 50 mm against "
+                "IMDAA on the valid day.\n\n"
+                "**Regimes** are a simple rule-based label (head-Bay vorticity, monsoon-core rainfall), not "
+                "an official synoptic classification.\n\n"
+                "The data grid is a rectangle (6-38N, 68-98E); the map and every statistic are clipped to "
+                "India's national boundary."
             )
 
-    # --- Resolve which archived case to show (India-only case statistics) ---
-    chosen_init_time = select_case_init_time(case_meta, event_filter, heatwave_threshold)
-    if chosen_init_time is None:
-        st.warning(f"No archived case matches '{event_filter}' in the current dataset -- showing the live forecast cycle instead.")
-        chosen_init_time = latest_init_time
-
-    case_df = df[df["init_time"] == chosen_init_time]
+    render_header(artifact, chosen_init_time)
     case_df_india = case_df[case_df["is_india"]]
-    case_regime = case_df["regime"].iloc[0] if len(case_df) else "quiescent"
+    case_regime = str(case_df["regime"].iloc[0]) if len(case_df) else "unknown"
 
     lead_df = case_df[case_df["lead_day"] == lead_day].copy()  # full rectangle: raster interpolation input only
     lead_df_india = lead_df[lead_df["is_india"]].copy()  # every statistic below uses this
+    if len(lead_df_india) == 0:
+        st.warning("No grid points inside India for this forecast cycle / lead day. Pick another cycle or lead day.")
+        st.stop()
 
     cache_key = f"{chosen_init_time}_{lead_day}"
     lead_df_india["dominant_risk_factor"] = compute_dominant_factors_for_case(artifact, lead_df_india, cache_key)
 
     st.markdown(
         f"""<div class="scenario-banner">
-            Showing forecast cycle initialized <b>{chosen_init_time}</b> &nbsp;|&nbsp;
+            Forecast issued <b>{pd.Timestamp(chosen_init_time).date()}</b>, valid <b>{(pd.Timestamp(chosen_init_time) + pd.Timedelta(days=lead_day)).date()}</b> &nbsp;|&nbsp;
             Dominant synoptic regime: <b>{REGIME_DISPLAY_SHORT.get(case_regime, case_regime)}</b> &nbsp;|&nbsp;
             Lead time: <b>Day {lead_day}</b> &nbsp;|&nbsp;
             Grid points in India: <b>{len(lead_df_india):,}</b>
@@ -798,7 +822,8 @@ def main() -> None:
 
     st.markdown(
         '<p class="footer-note">NCMRWF Forecast Bust Detection &mdash; Prototype for Smart India Hackathon 2026. '
-        "All data shown is synthetically generated for demonstration and is not an official MoES/NCMRWF product.</p>",
+        "Built on NCMRWF IMDAA reanalysis (July 2019) with a persistence reference forecast; "
+        "not an official MoES/NCMRWF operational product.</p>",
         unsafe_allow_html=True,
     )
 

@@ -1,0 +1,9 @@
+region,mean_confidence_pct,min_confidence_pct,n_points
+Indo_Gangetic_Plain,42.872437,0.053983927,2889
+Northeast_India,60.357018,0.62036514,2916
+Himalaya,67.12962,0.6924391,9693
+Peninsular_Plateau,90.720024,0.048732758,3717
+Thar_Desert,96.22855,5.810511,1890
+BoB_Coast,97.55913,0.16400218,10377
+Western_Ghats,99.19525,11.220705,756
+Arabian_Sea_Coast,99.79018,8.097672,4590

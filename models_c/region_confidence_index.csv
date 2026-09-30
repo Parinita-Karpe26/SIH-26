@@ -1,0 +1,9 @@
+region,mean_confidence_pct,min_confidence_pct,n_points
+Thar_Desert,75.9571,0.17811656,12600
+Peninsular_Plateau,76.891464,0.13501048,24780
+Indo_Gangetic_Plain,78.251366,0.790298,19260
+Himalaya,83.396164,10.757631,64620
+Northeast_India,84.38447,4.1391015,19440
+Western_Ghats,87.65574,5.7808695,5040
+Arabian_Sea_Coast,94.225784,0.694412,30600
+BoB_Coast,96.37142,0.5172789,69180

@@ -1,5 +1,10 @@
 data/processed_features.parquet
+data/processed_features_real.parquet
 __pycache__/
 .env
 venv/
 *.pyc
+dataset1/
+dataset2/
+SIH'26/
+data/

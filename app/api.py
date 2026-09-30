@@ -17,10 +17,12 @@ ONCE at process startup:
 
   1. The model artifact is loaded (model + feature schema + category
      vocabulary -- see ``explainability.py`` for the schema).
-  2. The processed-features dataset is loaded and filtered down to its most
-     recent forecast cycle (``init_time`` == max), i.e. "today's" Day 1..10
-     forecast -- exactly what an operational deployment would be serving at
-     any given moment.
+  2. The processed-features dataset is loaded and ONE forecast cycle is
+     cached. With the real IMDAA dataset (10 days, 1-10 July 2019) only
+     the EARLIEST cycle (issued 2019-07-01) can be verified out to Day 9 --
+     later cycles run out of observation days (the 07-09 cycle only has
+     Day 1). So by default the API serves the most recent cycle among those
+     with the MOST lead days available. Override with BUST_INIT_TIME.
   3. ``bust_probability`` is predicted for every cached grid point / lead
      day in one batched call.
   4. SHAP is run ONCE, in a single batched call, over that entire cached
@@ -55,8 +57,9 @@ From the project root (the folder containing app/, data/, models/):
 Then open http://127.0.0.1:8000/docs for interactive OpenAPI docs.
 
 Environment overrides (useful in containers):
-    BUST_DATA_PATH   -- path to processed_features.parquet
+    BUST_DATA_PATH   -- path to the dataset (default data/processed_features_real.parquet)
     BUST_MODEL_PATH  -- path to bust_detector.pkl
+    BUST_INIT_TIME   -- optional, e.g. 2019-07-05, to serve a specific forecast cycle
 
 Dependencies: fastapi, uvicorn, scipy, numpy, pandas, pydantic, plus whatever
 explainability.py/train_model.py need (xgboost/lightgbm, shap).
@@ -103,10 +106,11 @@ logger = logging.getLogger("bust_detection.api")
 # CONFIGURATION
 # ===========================================================================
 
-DATA_PATH = Path(os.environ.get("BUST_DATA_PATH", str(PROJECT_ROOT / "data" / "processed_features.parquet")))
+DATA_PATH = Path(os.environ.get("BUST_DATA_PATH", str(PROJECT_ROOT / "data" / "processed_features_real.parquet")))
 MODEL_PATH = Path(os.environ.get("BUST_MODEL_PATH", str(PROJECT_ROOT / "models" / "bust_detector.pkl")))
+INIT_TIME_OVERRIDE = os.environ.get("BUST_INIT_TIME")  # optional: serve a specific forecast cycle
 
-# Must match the GridConfig used by generate_data_and_features.py.
+# IMDAA download box used by generate_data_and_features_real.py.
 DOMAIN_LAT_MIN, DOMAIN_LAT_MAX = 6.0, 38.0
 DOMAIN_LON_MIN, DOMAIN_LON_MAX = 68.0, 98.0
 
@@ -137,7 +141,49 @@ SHORT_RISK_LABELS: Dict[str, str] = {
     "wind_speed10": "Strong forecast winds",
     "U10": "Strong zonal wind",
     "V10": "Strong meridional wind",
-    "T2m": "Temperature anomaly",
+    "T2m": "High current temperature",
+    # --- real IMDAA dataset features ---
+    "U850": "Strong 850 hPa zonal flow",
+    "V850": "Strong 850 hPa meridional flow",
+    "wind_speed850": "Strong 850 hPa monsoon flow",
+    "relative_vorticity_850_1e5_s": "850 hPa vorticity signal",
+    "divergence_850_1e5_s": "850 hPa convergence",
+    "wind_speed_gradient_850_per_100km": "Sharp 850 hPa wind gradient",
+    "T2m_subgrid_std": "Patchy temperatures in cell",
+    "T2m_recent_std": "Unsettled recent temperatures",
+    "T2m_tendency_1d": "Sharp temperature swing",
+    "Rain_subgrid_std": "Patchy convective rain",
+    "Rain_recent_std": "Erratic recent rainfall",
+    "Rain_tendency_1d": "Rapidly changing rainfall",
+    "clim_hist_mean_abs_temp_error": "Recent large temperature misses",
+    "clim_hist_mean_abs_rain_error": "Recent large rainfall misses",
+    "T2m_anom_prev3": "Unusual temperature",
+    "T2m_anom_to_date": "Unusual temperature",
+    "Rain_anom_prev3": "Unusual rainfall",
+    "Rain_wet_days_prev5": "On-off rain pattern",
+    "Rain_nbr_max": "Heavy rain nearby",
+    "Rain_nbr_mean": "Widespread rain nearby",
+    "T2m_nbr_range": "Sharp temperature boundary",
+    "T2m_gradient_per_100km": "Sharp temperature boundary",
+    "idx_bob_vorticity": "Bay of Bengal circulation",
+    "idx_monsoon_core_rain": "Monsoon activity",
+    # --- S2S forecast dataset features ---
+    "T850": "850 hPa temperature",
+    "T925": "925 hPa temperature",
+    "T500": "500 hPa temperature",
+    "T850_fcst_change_1d": "Forecast temperature swing",
+    "Rain_fcst_change_1d": "Shifting forecast rain band",
+    "lapse_850_500": "Weak atmospheric stability",
+    "shear_850_500": "Strong vertical wind shear",
+    "Z500": "500 hPa height pattern",
+    "lagged_spread_Rain": "Forecasts disagree on rain",
+    "lagged_spread_T850": "Forecasts disagree on temperature",
+    "lagged_spread_Z500": "Forecasts disagree on pattern",
+    "lagged_n_members": "Forecast agreement",
+    "orography_m": "Mountainous terrain",
+    "land_frac": "Coastline effect",
+    "lat": "Bust-prone location",
+    "lon": "Bust-prone location",
 }
 NO_RISK_LABEL = "No significant risk factor"
 
@@ -188,6 +234,8 @@ def compute_dominant_risk_factor(artifact: dict, X: pd.DataFrame) -> List[str]:
     and only if that contribution clears an absolute materiality floor
     (mirrors the logic in ``explainability.explain_bust``, so the per-point
     cached label and the on-demand narrative never disagree in spirit)."""
+    if len(X) == 0:
+        return []
     shap_matrix, _ = xai.compute_shap_matrix(artifact, X)
 
     feature_cols = artifact["feature_cols"]
@@ -207,6 +255,22 @@ def compute_dominant_risk_factor(artifact: dict, X: pd.DataFrame) -> List[str]:
     ]
 
 
+def choose_serving_init_time(df: pd.DataFrame, override: Optional[str] = None) -> pd.Timestamp:
+    """Pick which forecast cycle to serve. An explicit override wins;
+    otherwise the most recent cycle among those with the MOST lead days
+    (on the real 10-day dataset that is 2019-07-01, Day 1-9). Simply taking
+    max(init_time) would serve a cycle with only Day 1 data."""
+    inits = pd.to_datetime(df["init_time"])
+    if override:
+        wanted = pd.Timestamp(override)
+        if wanted not in set(inits.unique()):
+            raise ValueError(f"BUST_INIT_TIME={override} not in dataset. Available: {sorted(str(d.date()) for d in inits.unique())}")
+        return wanted
+    n_leads = df.groupby("init_time")["lead_day"].nunique()
+    best = n_leads[n_leads == n_leads.max()]
+    return pd.Timestamp(best.index.max())
+
+
 def build_model_store(data_path: Path, model_path: Path) -> ModelStore:
     t0 = time.perf_counter()
 
@@ -216,7 +280,7 @@ def build_model_store(data_path: Path, model_path: Path) -> ModelStore:
 
     logger.info("Loading dataset from %s ...", data_path)
     df = pd.read_parquet(data_path)
-    latest_init_time = df["init_time"].max()
+    latest_init_time = choose_serving_init_time(df, INIT_TIME_OVERRIDE)
     grid_df = df[df["init_time"] == latest_init_time].reset_index(drop=True).copy()
     n_unique_points = grid_df[["lat", "lon"]].drop_duplicates().shape[0]
     logger.info(
@@ -283,7 +347,7 @@ async def lifespan(app: FastAPI):
     except FileNotFoundError as exc:
         logger.error(
             "Startup failed -- could not find a required file (%s). "
-            "Run generate_data_and_features.py and train_model.py first, "
+            "Run generate_data_and_features_real.py and train_model.py first, "
             "or set BUST_DATA_PATH / BUST_MODEL_PATH.", exc,
         )
         raise
@@ -348,6 +412,8 @@ def _dump_model(m: BaseModel) -> dict:
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (np.floating, float)):
+        if not np.isfinite(value):
+            return None  # NaN (e.g. no verification history yet) is not valid JSON
         return round(float(value), 4)
     if isinstance(value, (np.integer,)):
         return int(value)
@@ -449,8 +515,8 @@ def forecast_grid(
                     "bust_probability": round(float(r.bust_probability), 4),
                     "confidence_score": round(float(r.confidence_pct), 2),
                     "dominant_risk_factor": r.dominant_risk_factor,
-                    "region": r.region,
-                    "regime": r.regime,
+                    "region": str(r.region),
+                    "regime": str(r.regime),
                 },
             }
             for r in sub.itertuples()
@@ -498,9 +564,9 @@ def explain_point(req: ExplainPointRequest):
     return {
         "query": _dump_model(req),
         "matched_grid_point": {"lat": matched_lat, "lon": matched_lon, "distance_km": round(distance_km, 1)},
-        "region": row["region"],
-        "regime": row["regime"],
-        "season": row["season"],
+        "region": str(row["region"]),
+        "regime": str(row["regime"]),
+        "season": str(row["season"]),
         "bust_probability": round(result["bust_probability"], 4),
         "confidence_pct": result["confidence_pct"],
         "risk_level": result["risk_level"],

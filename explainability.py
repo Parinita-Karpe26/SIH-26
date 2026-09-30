@@ -16,12 +16,14 @@ and provides:
      prediction and converts the top contributors into a plain-English
      meteorological rationale, e.g.:
 
-         "Confidence degraded to 22.0% (Severe bust risk) primarily due to
-          a steep the Bay of Bengal coastal belt pressure gradient
-          (~9.4 hPa/100km), often a precursor to rapid intensification and
-          elevated Day 7 ensemble spread in rainfall (2.31), showing the
-          members disagree on outcome, during a cyclonic depression over the
-          Bay of Bengal over the Bay of Bengal coastal belt."
+         "Confidence degraded to 18.4% (Severe bust risk) primarily due to
+          a sharp 1-day swing in maximum temperature (-4.2 C) and strong
+          850 hPa convergence (-3.1e-5 /s), during an active monsoon trough
+          over the Indo-Gangetic Plain."
+
+Feature names match ``generate_data_and_features_real.py`` (real NCMRWF
+IMDAA reanalysis). Explainers for the older synthetic-dataset features
+(MSLP, spread_*, ...) are kept, so artifacts trained on either dataset work.
 
 The artifact is entirely self-contained (model + feature schema + category
 vocabulary + imputation values) -- this file has NO dependency on
@@ -32,12 +34,12 @@ USAGE
 ------------------------------------------------------------------------------
     python explainability.py
     python explainability.py --model-path models/bust_detector.pkl \
-        --data data/processed_features.parquet
+        --data data/processed_features_real.parquet
 
     # or, programmatically, from another script:
     from explainability import load_artifact, explain_bust
     artifact = load_artifact("models/bust_detector.pkl")
-    result = explain_bust({"lead_day": 7, "pressure_gradient_hpa_per_100km": 9.4, ...}, artifact=artifact)
+    result = explain_bust({"lead_day": 5, "region": "Indo_Gangetic_Plain", "T2m_tendency_1d": -4.2, ...}, artifact=artifact)
     print(result["narrative"])
 
 Dependencies: numpy, pandas, shap, matplotlib, and whichever of
@@ -88,6 +90,8 @@ REGION_LABELS = {
 
 REGIME_LABELS = {
     "monsoon_trough": "an active monsoon trough",
+    "monsoon_break": "a weak / break phase of the monsoon",
+    "bay_of_bengal_low": "a head-Bay-of-Bengal monsoon low",
     "western_disturbance": "an active western disturbance",
     "bay_of_bengal_cyclone": "a cyclonic depression over the Bay of Bengal",
     "quiescent": "generally quiescent synoptic conditions",
@@ -126,6 +130,52 @@ FEATURE_FAMILY = {
     "predictability_decay_factor": "lead_time",
     "Rain_fcst": "precipitation",
     "T2m": "temperature",
+    # --- real IMDAA dataset features ---
+    "U850": "dynamics",
+    "V850": "dynamics",
+    "wind_speed850": "dynamics",
+    "relative_vorticity_850_1e5_s": "dynamics",
+    "divergence_850_1e5_s": "dynamics",
+    "wind_speed_gradient_850_per_100km": "dynamics",
+    "T2m_subgrid_std": "temperature_variability",
+    "T2m_recent_std": "temperature_variability",
+    "T2m_tendency_1d": "temperature_variability",
+    "Rain_subgrid_std": "rain_variability",
+    "Rain_recent_std": "rain_variability",
+    "Rain_tendency_1d": "rain_variability",
+    # --- anomaly / neighbourhood / regime-index features ---
+    "T2m_anom_prev3": "temperature_variability",
+    "T2m_anom_to_date": "temperature_variability",
+    "T2m_nbr_range": "temperature_contrast",
+    "T2m_gradient_per_100km": "temperature_contrast",
+    "Rain_anom_prev3": "rain_variability",
+    "Rain_wet_days_prev5": "rain_variability",
+    "Rain_nbr_max": "rain_nearby",
+    "Rain_nbr_mean": "rain_nearby",
+    "idx_bob_vorticity": "regime_strength",
+    "idx_monsoon_core_rain": "regime_strength",
+    # --- S2S forecast dataset features ---
+    "T850": "temperature",
+    "T925": "temperature",
+    "T500": "temperature",
+    "T850_fcst_change_1d": "temperature_variability",
+    "Rain_fcst_change_1d": "rain_variability",
+    "lapse_850_500": "stability",
+    "shear_850_500": "dynamics",
+    "Z500": "pressure",
+    "U10": "dynamics",
+    "V10": "dynamics",
+    "wind_speed10": "dynamics",
+    "lagged_spread_Rain": "spread",
+    "lagged_spread_T850": "spread",
+    "lagged_spread_Z500": "spread",
+    "lagged_n_members": "spread",
+    "land_frac": "location",
+    "orography_m": "location",
+    "clim_hist_mean_abs_temp_error": "climatology",
+    "clim_hist_mean_abs_rain_error": "climatology",
+    "lat": "location",
+    "lon": "location",
 }
 
 
@@ -157,7 +207,9 @@ def _explain_pressure_gradient(value, row):
 
 
 def _explain_pressure_deficit(value, row):
-    return f"an active low-pressure system near {_fmt_region(row)} ({value:.1f} hPa below the climatological background)"
+    if value <= 0:
+        return f"forecast pressure {abs(value):.1f} hPa above its surroundings near {_fmt_region(row)}"
+    return f"a forecast low-pressure area near {_fmt_region(row)} ({value:.1f} hPa below its surroundings)"
 
 
 def _explain_vorticity(value, row):
@@ -208,7 +260,9 @@ def _explain_lead_day(value, row):
 
 
 def _explain_rain_fcst(value, row):
-    return f"a heavy forecast rainfall total ({value:.1f} mm/24h), which ensembles historically struggle to place precisely"
+    if value >= 50:
+        return f"a heavy forecast rainfall total ({value:.1f} mm/24h), which is very hard to place precisely day to day"
+    return f"a forecast rainfall total of {value:.1f} mm/24h in an area where monsoon rain switches on and off quickly"
 
 
 def _explain_mslp(value, row):
@@ -217,6 +271,155 @@ def _explain_mslp(value, row):
 
 def _explain_wind_speed(value, row):
     return f"strong forecast surface winds (~{value:.1f} m/s)"
+
+
+def _explain_vorticity_850(value, row):
+    sense = "cyclonic" if value > 0 else "anticyclonic"
+    return f"{sense} 850 hPa vorticity (~{value:.1f}e-5 /s) near {_fmt_region(row)}"
+
+
+def _explain_divergence_850(value, row):
+    if value < 0:
+        return f"strong 850 hPa convergence ({value:.1f}e-5 /s), which feeds convection that is hard to place day to day"
+    return f"850 hPa divergence ({value:+.1f}e-5 /s), suppressing rainfall that could quickly reverse"
+
+
+def _explain_speed_gradient_850(value, row):
+    return f"a sharp 850 hPa wind-speed gradient (~{value:.1f} m/s per 100km), marking a nearby jet or trough edge"
+
+
+def _explain_wind_speed_850(value, row):
+    return f"strong 850 hPa monsoon flow (~{value:.1f} m/s)"
+
+
+def _explain_t2m(value, row):
+    return f"a current maximum temperature of {value:.1f} C that is liable to change sharply"
+
+
+def _explain_t2m_tendency(value, row):
+    return f"a sharp 1-day swing in maximum temperature ({value:+.1f} C), showing the air mass is changing"
+
+
+def _explain_t2m_recent_std(value, row):
+    return f"unsettled recent temperatures (day-to-day std {value:.1f} C)"
+
+
+def _explain_t2m_subgrid(value, row):
+    return f"large temperature contrasts within the grid cell (std {value:.1f} C), typical of terrain or a moving boundary"
+
+
+def _explain_rain_tendency(value, row):
+    return f"a large 1-day change in rainfall ({value:+.1f} mm), showing an active, shifting rain pattern"
+
+
+def _explain_rain_recent_std(value, row):
+    return f"erratic recent rainfall (day-to-day std {value:.1f} mm)"
+
+
+def _explain_rain_subgrid(value, row):
+    return f"patchy rainfall within the grid cell (std {value:.1f} mm), i.e. convective showers that are hard to place"
+
+
+def _explain_clim_abs_temp_error(value, row):
+    return f"a recent track record of large temperature misses (~{value:.1f} C) at this location"
+
+
+def _explain_clim_abs_rain_error(value, row):
+    return f"a recent track record of large rainfall misses (~{value:.1f} mm) at this location"
+
+
+def _explain_location(value, row):
+    return f"the location itself ({_fmt_region(row)}), where forecasts have been failing more often"
+
+
+def _explain_t2m_anom(value, row):
+    word = "hotter" if value > 0 else "cooler"
+    return f"today running {abs(value):.1f} C {word} than recent days at this spot, a sign the air mass is changing"
+
+
+def _explain_rain_anom(value, row):
+    word = "wetter" if value > 0 else "drier"
+    return f"today being {abs(value):.0f} mm {word} than recent days here, so the rain pattern is shifting"
+
+
+def _explain_wet_days(value, row):
+    return f"rain on {value * 100:.0f}% of the last five days, an on-off pattern that is hard to carry forward"
+
+
+def _explain_rain_nbr_max(value, row):
+    return f"heavy rain nearby (up to {value:.0f} mm within about 1 deg) that could move in by the valid day"
+
+
+def _explain_rain_nbr_mean(value, row):
+    return f"widespread rain in the surrounding area (~{value:.0f} mm on average within about 1 deg)"
+
+
+def _explain_t2m_contrast(value, row):
+    return f"a sharp temperature contrast nearby ({value:.1f} C across about 1 deg), typical of an advancing monsoon boundary"
+
+
+def _explain_t2m_gradient(value, row):
+    return f"a strong temperature gradient ({value:.1f} C per 100 km), marking a boundary between air masses"
+
+
+def _explain_idx_bob(value, row):
+    return f"the strength of circulation over the head Bay of Bengal ({value:.1f}e-5 /s), which steers monsoon lows inland"
+
+
+def _explain_idx_core_rain(value, row):
+    return f"how active the monsoon is across central India ({value:.1f} mm average rain)"
+
+
+def _explain_u850(value, row):
+    word = "westerly (monsoon)" if value > 0 else "easterly"
+    return f"{abs(value):.1f} m/s {word} flow at 850 hPa, a key control on where monsoon rain sets up"
+
+
+def _explain_v850(value, row):
+    word = "southerly" if value > 0 else "northerly"
+    return f"{abs(value):.1f} m/s {word} flow at 850 hPa, pulling in air of a different origin"
+
+
+def _explain_t850(value, row):
+    return f"a forecast 850 hPa temperature of {value:.1f} C, a level where the model's temperature errors are largest here"
+
+
+def _explain_t850_change(value, row):
+    return f"a sharp day-to-day swing in the forecast 850 hPa temperature ({value:+.1f} C), showing a changing air mass"
+
+
+def _explain_rain_change(value, row):
+    return f"forecast rainfall changing fast from one day to the next ({value:+.1f} mm), a sign of a shifting rain band"
+
+
+def _explain_lapse(value, row):
+    if value >= 25:
+        return f"a weakly stable atmosphere (850-500 hPa temperature drop {value:.1f} C), favouring convection that is hard to place"
+    return f"the forecast vertical temperature structure (850-500 hPa drop {value:.1f} C)"
+
+
+def _explain_shear_850_500(value, row):
+    return f"strong vertical wind shear between 850 and 500 hPa ({value:.1f} m/s), which disorganises convection"
+
+
+def _explain_z500(value, row):
+    return f"the forecast 500 hPa height pattern ({value:.0f} m) over {_fmt_region(row)}"
+
+
+def _make_lagged_spread_explainer(label: str, unit: str) -> Callable:
+    def _f(value, row):
+        return (f"forecasts started on different days disagreeing on {label} ({value:.1f} {unit} spread for "
+                f"{_fmt_lead(row)}), a sign the situation is hard to predict")
+
+    return _f
+
+
+def _explain_orography(value, row):
+    return f"mountainous terrain (~{value:.0f} m), where coarse models struggle to place rain and temperature"
+
+
+def _explain_land_frac(value, row):
+    return "the land-sea boundary in this grid cell, where the model's coastal representation is crude" if 0.1 < value < 0.9 else f"the surface type (land fraction {value:.1f})"
 
 
 def _explain_generic(feature_name, value, row):
@@ -247,6 +450,47 @@ FEATURE_EXPLAINERS: Dict[str, Callable] = {
     "Rain_fcst": _explain_rain_fcst,
     "MSLP": _explain_mslp,
     "wind_speed10": _explain_wind_speed,
+    # --- real IMDAA dataset features ---
+    "relative_vorticity_850_1e5_s": _explain_vorticity_850,
+    "divergence_850_1e5_s": _explain_divergence_850,
+    "wind_speed_gradient_850_per_100km": _explain_speed_gradient_850,
+    "wind_speed850": _explain_wind_speed_850,
+    "T2m": _explain_t2m,
+    "T2m_tendency_1d": _explain_t2m_tendency,
+    "T2m_recent_std": _explain_t2m_recent_std,
+    "T2m_subgrid_std": _explain_t2m_subgrid,
+    "Rain_tendency_1d": _explain_rain_tendency,
+    "Rain_recent_std": _explain_rain_recent_std,
+    "Rain_subgrid_std": _explain_rain_subgrid,
+    "clim_hist_mean_abs_temp_error": _explain_clim_abs_temp_error,
+    "clim_hist_mean_abs_rain_error": _explain_clim_abs_rain_error,
+    "lat": _explain_location,
+    "lon": _explain_location,
+    # --- anomaly / neighbourhood / regime-index features ---
+    "U850": _explain_u850,
+    "V850": _explain_v850,
+    "T2m_anom_prev3": _explain_t2m_anom,
+    "T2m_anom_to_date": _explain_t2m_anom,
+    "Rain_anom_prev3": _explain_rain_anom,
+    "Rain_wet_days_prev5": _explain_wet_days,
+    "Rain_nbr_max": _explain_rain_nbr_max,
+    "Rain_nbr_mean": _explain_rain_nbr_mean,
+    "T2m_nbr_range": _explain_t2m_contrast,
+    "T2m_gradient_per_100km": _explain_t2m_gradient,
+    "idx_bob_vorticity": _explain_idx_bob,
+    "idx_monsoon_core_rain": _explain_idx_core_rain,
+    # --- S2S forecast dataset features ---
+    "T850": _explain_t850,
+    "T850_fcst_change_1d": _explain_t850_change,
+    "Rain_fcst_change_1d": _explain_rain_change,
+    "lapse_850_500": _explain_lapse,
+    "shear_850_500": _explain_shear_850_500,
+    "Z500": _explain_z500,
+    "lagged_spread_Rain": _make_lagged_spread_explainer("rainfall", "mm"),
+    "lagged_spread_T850": _make_lagged_spread_explainer("850 hPa temperature", "C"),
+    "lagged_spread_Z500": _make_lagged_spread_explainer("the 500 hPa pattern", "m"),
+    "orography_m": _explain_orography,
+    "land_frac": _explain_land_frac,
 }
 
 
@@ -332,15 +576,17 @@ def _encode_row(row: pd.Series, artifact: dict) -> pd.DataFrame:
     feature_cols = artifact["feature_cols"]
     categorical_cols = artifact["categorical_cols"]
     category_levels = artifact["category_levels"]
-    numeric_fill = artifact["numeric_fill_values"]
-
     X = pd.DataFrame([row[feature_cols]])
     for c in categorical_cols:
         mapping = {cat: i for i, cat in enumerate(category_levels[c])}
         X[c] = X[c].astype(str).map(mapping).fillna(-1).astype(int)
     for c in feature_cols:
         if c not in categorical_cols:
-            X[c] = pd.to_numeric(X[c], errors="coerce").fillna(numeric_fill.get(c, 0.0))
+            # NaN is kept as-is: the real dataset legitimately has NaN (e.g. no
+            # verification history yet on the first day) and XGBoost/LightGBM
+            # were trained with those NaN handled natively. Filling them here
+            # would make single-point predictions disagree with batch ones.
+            X[c] = pd.to_numeric(X[c], errors="coerce").astype(float)
     return X[feature_cols]
 
 
@@ -422,7 +668,7 @@ def global_feature_importance(
         fig, ax = plt.subplots(figsize=(8, 0.4 * len(top) + 1.5))
         ax.barh(top["feature"], top["mean_abs_shap"], color="#2b6cb0")
         ax.set_xlabel("mean |SHAP value|  (impact on bust-probability log-odds)")
-        ax.set_title("Global Feature Importance -- NCMRWF Forecast Bust Detector")
+        ax.set_title("Global Feature Importance -- BustGuard (NCMRWF IMDAA data)")
         fig.tight_layout()
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=150)
@@ -510,6 +756,11 @@ def explain_bust(
     for c in contributions:
         if c["feature"] in categorical_cols or c["shap_value"] <= materiality_floor:
             continue
+        try:
+            if pd.isna(c["value"]):  # e.g. no history yet on the first day -- nothing meaningful to say
+                continue
+        except (TypeError, ValueError):
+            pass
         family = FEATURE_FAMILY.get(c["feature"], c["feature"])
         if family in used_families:
             continue
@@ -542,7 +793,7 @@ def explain_bust(
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SHAP-based explainability demo for the NCMRWF forecast-bust detector.")
     p.add_argument("--model-path", type=str, default="models/bust_detector.pkl")
-    p.add_argument("--data", type=str, default="data/processed_features.parquet", help="Optional: dataset to pull demo examples / a global-importance sample from.")
+    p.add_argument("--data", type=str, default="data/processed_features_real.parquet", help="Optional: dataset to pull demo examples / a global-importance sample from.")
     p.add_argument("--sample-size", type=int, default=5000, help="Rows sampled for global feature importance.")
     p.add_argument("--top-k", type=int, default=2)
     return p.parse_args(argv)
@@ -599,16 +850,19 @@ def main(argv=None) -> None:
     else:
         logger.info("Dataset not found at %s -- running explain_bust() on a hand-crafted example instead.", data_path)
         example = {
-            "lead_day": 7,
-            "lead_day_norm": 0.7,
-            "region": "BoB_Coast",
-            "regime": "bay_of_bengal_cyclone",
-            "season": "post_monsoon",
-            "pressure_gradient_hpa_per_100km": 9.4,
-            "pressure_deficit": 22.0,
-            "relative_vorticity_1e5_s": 18.0,
-            "spread_Rain": 2.3,
-            "spread_composite": 1.4,
+            "lead_day": 5,
+            "lead_day_norm": 0.5,
+            "lead_day_bucket": "day_4_7",
+            "region": "Indo_Gangetic_Plain",
+            "regime": "monsoon_trough",
+            "season": "monsoon",
+            "lat": 26.5,
+            "lon": 82.0,
+            "T2m": 38.5,
+            "T2m_tendency_1d": -4.2,
+            "Rain_fcst": 12.0,
+            "divergence_850_1e5_s": -3.1,
+            "relative_vorticity_850_1e5_s": 4.0,
         }
         result = explain_bust(example, artifact=artifact, top_k=args.top_k)
         print("=" * 74)
